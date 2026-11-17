@@ -1,19 +1,10 @@
-// WCZZRed 0.2-1
-// Standalone red packet detail overlay for WeChat 8.0.75.
+// WCZZRed 0.2-1 - standalone red packet detail overlay for WeChat 8.0.75.
 // Extracted from WCZZ: always on, no switches, no settings, no plugin registration.
 //
-// 0.2 (optimized):
-//   * WCZZLog compiles out entirely when WCZZ_DEBUG == 0
-//   * red packet model is parsed once into a plain struct (was 4+ KVC calls per pass)
-//   * one apply token per view controller: old deferred passes bail out instead of
-//     re-running, and deferred blocks hold the VC weakly
-//   * no bringSubviewToFront (zPosition already guarantees draw order)
-//   * the label is never created inside a layout pass
-//   * hooks install synchronously when the classes are already registered
-//   * no strong global reference to WeChat's data model
-//   * unchanged refreshes skip string formatting and label relayout entirely
-//   * the four counters are read straight from the instance (ivar offset + real
-//     runtime type encoding) instead of KVC; KVC stays as the fallback path
+// Design notes: logging compiles out unless WCZZ_DEBUG; the model is parsed once
+// per pass into a struct whose scalars are read straight from the instance (ivar
+// offset + runtime type encoding, KVC as fallback); deferred passes are weakly
+// captured and superseded by a per-VC token; unchanged values skip formatting.
 
 #import "WeChatCompat.h"
 #import "WeChatHeaders.h"
@@ -120,7 +111,6 @@ static NSString *const WCZZRedFieldKeys[WCZZ_FIELD_COUNT] = {
 static const char *const WCZZRedFieldNames[WCZZ_FIELD_COUNT] = {
     "m_lTotalAmount", "m_lTotalNum", "m_lRecAmount", "m_lRecNum"
 };
-
 typedef struct {
     Class cls;
     ptrdiff_t offset[WCZZ_FIELD_COUNT];
@@ -224,57 +214,42 @@ static NSString *WCZZRedSummaryText(WCZZRedSummary summary) {
             remainAmount / 100.0];
 }
 
-static UILabel *WCZZRedSummaryLabel(id vc) {
-    if (![vc isKindOfClass:[UIViewController class]]) return nil;
-
-    id associated = objc_getAssociatedObject(vc, WCZZRedSummaryLabelKey);
-    if ([associated isKindOfClass:[UILabel class]]) return associated;
-
-    // Re-adopt an existing label if the view hierarchy was rebuilt.
-    UIView *root = [(UIViewController *)vc view];
-    UIView *found = root ? [root viewWithTag:WCZZRedSummaryLabelTag] : nil;
-    if ([found isKindOfClass:[UILabel class]]) {
-        objc_setAssociatedObject(vc, WCZZRedSummaryLabelKey, found, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return (UILabel *)found;
-    }
-    return nil;
-}
-
-static UILabel *WCZZEnsureRedSummaryLabel(id vc) {
+// create == NO comes from the layout pass, where adding a subview would kick off
+// another layout round.
+static UILabel *WCZZRedSummaryLabel(id vc, BOOL create) {
     if (![vc isKindOfClass:[UIViewController class]]) return nil;
 
     UIView *root = [(UIViewController *)vc view];
     if (!root) return nil;
 
-    UILabel *label = WCZZRedSummaryLabel(vc);
-    if (label) {
-        if (label.superview != root) [root addSubview:label];
-        return label;
-    }
+    UILabel *label = objc_getAssociatedObject(vc, WCZZRedSummaryLabelKey);
+    if (![label isKindOfClass:[UILabel class]]) {
+        if (!create) return nil;
 
-    label = [[UILabel alloc] initWithFrame:CGRectZero];
-    label.tag = WCZZRedSummaryLabelTag;
-    label.numberOfLines = 4;
-    label.textAlignment = NSTextAlignmentCenter;
-    label.textColor = [UIColor whiteColor];
-    label.backgroundColor = [UIColor clearColor];
-    // Bolder than the original regular weight: monospaced digits + Medium.
-    // Swap UIFontWeightMedium for UIFontWeightSemibold / UIFontWeightBold to go heavier.
-    label.font = [UIFont monospacedDigitSystemFontOfSize:14.0 weight:UIFontWeightMedium];
-    label.userInteractionEnabled = NO;
-    label.layer.zPosition = 1000.0;
-    [root addSubview:label];
+        // Re-adopt a label left behind by a rebuilt view hierarchy.
+        label = (UILabel *)[root viewWithTag:WCZZRedSummaryLabelTag];
+        if (![label isKindOfClass:[UILabel class]]) {
+            label = [[UILabel alloc] initWithFrame:CGRectZero];
+            label.tag = WCZZRedSummaryLabelTag;
+            label.numberOfLines = 4;
+            label.textAlignment = NSTextAlignmentCenter;
+            label.textColor = [UIColor whiteColor];
+            label.backgroundColor = [UIColor clearColor];
+            // Bolder than the original: monospaced digits + Medium. Use
+            // UIFontWeightSemibold / UIFontWeightBold for more weight.
+            label.font = [UIFont monospacedDigitSystemFontOfSize:14.0 weight:UIFontWeightMedium];
+            label.userInteractionEnabled = NO;
+            label.layer.zPosition = 1000.0;
+        }
+    }
+    if (label.superview != root) [root addSubview:label];
     objc_setAssociatedObject(vc, WCZZRedSummaryLabelKey, label, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     return label;
 }
 
-// Layout only: never creates a subview, so it is safe to call from
-// viewDidLayoutSubviews.
 static void WCZZLayoutRedSummaryLabel(id vc) {
-    if (![vc isKindOfClass:[UIViewController class]]) return;
-
-    UILabel *label = WCZZRedSummaryLabel(vc);
+    UILabel *label = WCZZRedSummaryLabel(vc, NO);
     UIView *root = [(UIViewController *)vc view];
     if (!label || !root) return;
 
@@ -297,7 +272,7 @@ static void WCZZApplyRedSummary(id vc, id data) {
         return;
     }
 
-    UILabel *label = WCZZEnsureRedSummaryLabel(vc);
+    UILabel *label = WCZZRedSummaryLabel(vc, YES);
     if (!label) return;
 
     // Consecutive passes almost always see the same numbers. Compare the parsed
@@ -379,60 +354,65 @@ static id WCZZResolveRedData(id vc) {
     return data;
 }
 
+// Shared bodies so the hook list stays declarative.
+
+static void WCZZStashRedData(id obj, id data) {
+    if (!obj || !data) return;
+    WCZZLatestRedData = data;
+    objc_setAssociatedObject(obj, WCZZRedDataKey, data, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// Resolving on the control logic keeps a strong reference to the model on it, so
+// the weak global stays valid for the whole flow.
+static void WCZZNoteDetailData(id logic) {
+    (void)WCZZResolveRedData(logic);
+}
+
+static void WCZZRefreshOverlay(id vc) {
+    id data = WCZZResolveRedData(vc);
+    if (data) WCZZScheduleRedSummary(vc, data);
+}
+
 %group WCZZRedHooks
 
 %hook WCRedEnvelopesControlLogic
 - (id)initWithData:(id)data {
     id obj = %orig(data);
-    if (data) WCZZLatestRedData = data;
-    if (obj && data) objc_setAssociatedObject(obj, WCZZRedDataKey, data, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    WCZZLog(@"red control init data=%p", data);
+    WCZZStashRedData(obj, data);
     return obj;
 }
 - (void)showDetailView {
     %orig;
-    id data = WCZZResolveRedData(self);
-    if (!data) data = WCZZLatestRedData;
-    WCZZLog(@"red base showDetailView data=%p", data);
+    WCZZNoteDetailData(self);
 }
 %end
 
 %hook WCRedEnvelopesReceiveControlLogic
 - (id)initWithData:(id)data Scene:(int)scene {
     id obj = %orig(data, scene);
-    if (data) WCZZLatestRedData = data;
-    if (obj && data) objc_setAssociatedObject(obj, WCZZRedDataKey, data, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    WCZZLog(@"red receive init scene=%d data=%p obj=%p", scene, data, obj);
+    WCZZStashRedData(obj, data);
     return obj;
 }
 - (id)initWithData:(id)data {
     id obj = %orig(data);
-    if (data) WCZZLatestRedData = data;
-    if (obj && data) objc_setAssociatedObject(obj, WCZZRedDataKey, data, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    WCZZLog(@"red receive init data=%p obj=%p", data, obj);
+    WCZZStashRedData(obj, data);
     return obj;
 }
 - (void)showDetailView {
     %orig;
-    id data = WCZZResolveRedData(self);
-    if (!data) data = WCZZLatestRedData;
-    WCZZLog(@"red receive showDetailView data=%p", data);
+    WCZZNoteDetailData(self);
 }
 %end
 
 %hook WCRedEnvelopesRedEnvelopesDetailViewController
 - (id)init {
     id obj = %orig;
-    id data = WCZZLatestRedData;
-    if (obj && data) objc_setAssociatedObject(obj, WCZZRedDataKey, data, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    WCZZLog(@"red detail init vc=%p data=%p", obj, data);
+    WCZZStashRedData(obj, WCZZLatestRedData);
     return obj;
 }
 - (void)viewDidLoad {
     %orig;
-    id data = WCZZResolveRedData(self);
-    WCZZLog(@"red detail viewDidLoad data=%p", data);
-    if (data) WCZZScheduleRedSummary(self, data);
+    WCZZRefreshOverlay(self);
     WCZZLayoutRedSummaryLabel(self);
 }
 - (void)viewDidLayoutSubviews {
@@ -441,20 +421,15 @@ static id WCZZResolveRedData(id vc) {
 }
 - (void)refreshViewWithData:(id)data {
     %orig(data);
-    WCZZLog(@"red refreshViewWithData data=%p", data);
     if (data) WCZZScheduleRedSummary(self, data);
 }
 - (void)viewWillAppear:(BOOL)animated {
     %orig(animated);
-    id data = WCZZResolveRedData(self);
-    WCZZLog(@"red detail viewWillAppear data=%p", data);
-    if (data) WCZZScheduleRedSummary(self, data);
+    WCZZRefreshOverlay(self);
 }
 - (void)viewDidAppear:(BOOL)animated {
     %orig(animated);
-    id data = WCZZResolveRedData(self);
-    WCZZLog(@"red detail viewDidAppear data=%p", data);
-    if (data) WCZZScheduleRedSummary(self, data);
+    WCZZRefreshOverlay(self);
 }
 %end
 
